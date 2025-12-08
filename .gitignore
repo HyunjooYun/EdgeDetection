@@ -1,0 +1,37 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Logs and checkpoints
+*.log
+*.ckpt
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Machine learning artifacts
+artifacts/
+runs/
+outputs/
+
+# TensorBoard temp files
+*.tfevents.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
