@@ -26,6 +26,10 @@ artifacts/
 runs/
 outputs/
 
+# Dataset inputs
+inputs/*
+!inputs/README.md
+
 # TensorBoard temp files
 *.tfevents.*
 

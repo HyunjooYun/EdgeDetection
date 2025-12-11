@@ -51,6 +51,8 @@ class HEDPostProcessConfig:
 
     image_dir: Path
     hed_config: Optional[HedConfig] = None
+    ground_truth_dir: Optional[Path] = None
+    precomputed_edge_dir: Optional[Path] = None
     parameter_specs: Sequence[ParameterSpec] = field(
         default_factory=lambda: (
             ParameterSpec("threshold", 0.05, 1.0, 0.05, 0.45),
@@ -91,6 +93,11 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         self.image_paths: List[Path] = self._collect_images(config.image_dir)
         if not self.image_paths:
             raise ValueError(f"no images found in {config.image_dir}")
+
+        if config.ground_truth_dir is not None and not config.ground_truth_dir.exists():
+            raise FileNotFoundError(f"ground truth directory not found: {config.ground_truth_dir}")
+        if config.precomputed_edge_dir is not None and not config.precomputed_edge_dir.exists():
+            raise FileNotFoundError(f"precomputed edge directory not found: {config.precomputed_edge_dir}")
 
         self.hed_model: Optional[HEDModel] = None
         if config.hed_config is not None:
@@ -243,14 +250,18 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         cache_key = image_path.name
         if cache_key in self._base_edge_cache:
             return self._base_edge_cache[cache_key]
-        if self.hed_model is None:
-            raise RuntimeError("HED model not configured; cannot compute edge map")
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise FileNotFoundError(f"unable to load image at {image_path}")
-        base_edge = self.hed_model.infer(image)
+        base_edge: Optional[np.ndarray] = None
+        if self.config.precomputed_edge_dir is not None:
+            base_edge = self._load_precomputed_edge(image_path)
         if base_edge is None:
-            raise ValueError(f"failed to compute edge map for {image_path}")
+            if self.hed_model is None:
+                raise RuntimeError("HED model not configured; cannot compute edge map")
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(f"unable to load image at {image_path}")
+            base_edge = self.hed_model.infer(image)
+            if base_edge is None:
+                raise ValueError(f"failed to compute edge map for {image_path}")
         if self.config.cache_edges:
             self._base_edge_cache[cache_key] = base_edge
         return base_edge
@@ -259,11 +270,15 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         cache_key = image_path.name
         if cache_key in self._ground_truth_edges:
             return
-        target_params = self.target_parameters.get(cache_key)
-        if target_params is None:
-            target_params = {spec.name: spec.initial for spec in self.parameter_specs}
-        base_edge = self._get_base_edge(image_path)
-        target_edge = self._apply_postprocessing(base_edge, target_params)
+        target_edge: Optional[np.ndarray] = None
+        if self.config.ground_truth_dir is not None:
+            target_edge = self._load_ground_truth_edge(image_path)
+        if target_edge is None:
+            target_params = self.target_parameters.get(cache_key)
+            if target_params is None:
+                target_params = {spec.name: spec.initial for spec in self.parameter_specs}
+            base_edge = self._get_base_edge(image_path)
+            target_edge = self._apply_postprocessing(base_edge, target_params)
         self._ground_truth_edges[cache_key] = target_edge
 
     def _calculate_reward_with_edges(self, image_path: Path, params: Dict[str, float]) -> float:
@@ -272,6 +287,37 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         base_edge = self._get_base_edge(image_path)
         prediction = self._apply_postprocessing(base_edge, params)
         return self._f1_score(prediction, gt)
+
+    def _load_precomputed_edge(self, image_path: Path) -> Optional[np.ndarray]:
+        assert self.config.precomputed_edge_dir is not None
+        candidates = [
+            self.config.precomputed_edge_dir / image_path.name,
+            self.config.precomputed_edge_dir / f"{image_path.stem}_hed.png",
+            self.config.precomputed_edge_dir / f"{image_path.stem}.png",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                edge = cv2.imread(str(candidate), cv2.IMREAD_GRAYSCALE)
+                if edge is None:
+                    continue
+                return edge.astype(np.float32) / 255.0
+        return None
+
+    def _load_ground_truth_edge(self, image_path: Path) -> Optional[np.ndarray]:
+        assert self.config.ground_truth_dir is not None
+        candidates = [
+            self.config.ground_truth_dir / image_path.name,
+            self.config.ground_truth_dir / f"{image_path.stem}.png",
+            self.config.ground_truth_dir / f"{image_path.stem}.jpg",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                gt = cv2.imread(str(candidate), cv2.IMREAD_GRAYSCALE)
+                if gt is None:
+                    continue
+                normalized = gt.astype(np.float32) / 255.0
+                return normalized
+        return None
 
     def _apply_postprocessing(self, base_edge: np.ndarray, params: Dict[str, float]) -> np.ndarray:
         edge = base_edge.astype(np.float32).copy()
