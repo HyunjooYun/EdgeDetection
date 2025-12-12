@@ -19,6 +19,7 @@ core = [
     "opencv-python>=4.8.0",
     "stable-baselines3>=2.2.0",
     "torch>=2.3.0",
+    "ray[tune]>=2.9.0",
 ]
 docs = ["pypdf>=4.0.0"]
 

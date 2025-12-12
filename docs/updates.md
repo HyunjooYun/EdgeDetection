@@ -45,3 +45,30 @@
 ### 다음 단계 제안 (업데이트)
 1. HED 후처리 파이프라인의 파라메터-연산 매핑 정교화 및 추가 지표(IoU, BPR) 계산 모듈 구현.
 2. 실제 GT 에지 라벨이 포함된 데이터셋을 도입하여 pseudo GT 대비 평가의 신뢰성을 향상시키고, DQN 학습 실험을 반복/로그 정리.
+
+## 진행 기록 - 2025-12-11
+
+### 학습 자동화
+- `requirements.txt`, `pyproject.toml`에 `ray[tune]`을 추가해 분산 하이퍼파라미터 탐색을 지원.
+- `scripts/tune_hyperparams.py`를 작성해 DQN/PPO용 Ray Tune 파이프라인을 구축, 학습 환경 생성 로직을 통합하고 `mean_reward` 기준으로 최적 config를 자동 추출하도록 구성.
+- README에 Ray Tune 실행 예시와 결과 디렉터리(`runs/tune/hed_rl_tune`) 확인 방법을 문서화.
+
+### 다음 단계 제안
+1. `tune_hyperparams.py` 결과를 활용해 선정된 하이퍼파라미터로 장기 학습을 재실행하고 TensorBoard 로그와 이미지 롤아웃을 비교 분석.
+2. Optuna/Ray Tune 결과를 `docs/development_plan.md`에 실험 로그 표로 정리해 향후 실험 재현성을 높일 것.
+
+## 진행 기록 - 2025-12-12
+
+### PPO/DQN 최적화 실행
+- Ray Tune으로 PPO와 DQN 각각 200k 스텝 기준 4-trial 탐색을 수행, DQN 최고 trial의 `mean_reward≈21.05` 구성 확인.
+- Tune 결과를 기반으로 `scripts/train_ppo.py`, `scripts/train_dqn.py`를 200k timesteps로 재학습해 `artifacts/ppo_train.zip`, `artifacts/dqn_hed.zip`과 `runs/ppo/`, `runs/dqn/` TensorBoard 로그를 확보.
+- 학습 중 RolloutImageCallback을 통해 모델별 비교 이미지를 TensorBoard에 기록, `image-log-count` 파라미터로 샘플 수를 5장으로 확장.
+
+### 평가 및 결과 아카이빙
+- `scripts/evaluate_agents.py`를 새로 작성해 PPO/DQN을 동일 환경에서 20 에피소드 평가하고 SummaryWriter로 `runs/eval`에 지표·이미지를 기록.
+- 평가 요약(`artifacts/eval_results.json`)에 모델별 mean/std reward와 에피소드 길이를 저장, 콘솔 로그로도 확인 가능하게 구성.
+- TensorBoard 이벤트 파일에서 롤아웃 이미지를 추출해 `artifacts/eval_images/ppo_rollout_xx.png`, `artifacts/eval_images/dqn_rollout_xx.png` 형태로 저장, 시각 비교 자료로 활용.
+
+### 다음 단계 제안
+1. 평가 스크립트에 PSNR, IoU 등 추가 지표를 연동해 모델 성능을 다각도로 분석.
+2. 학습·평가 로그를 기반으로 문서화(README, development_plan) 및 테스트셋 분리 실험을 준비.

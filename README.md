@@ -5,6 +5,7 @@
 - `hed_rl` 패키지: OpenAI Gym 스타일의 `HEDPostProcessEnv` 환경, 파라메터 스펙, HED 추론 유틸리티.
 - `scripts/simulate_env.py`: 환경을 빠르게 실행해보는 데모 스크립트.
 - `scripts/run_hed_edges.py`: HED Caffe 모델로 테스트 이미지의 에지 맵을 생성하는 유틸리티.
+- `scripts/evaluate_agents.py`: 학습된 에이전트를 일괄 평가하고 TensorBoard/PNG로 비교 자료를 남기는 스크립트.
 - `docs/development_plan.md`: 전체 개발 방향과 리서치 포커스 정리 문서.
 
 ## 설치
@@ -65,7 +66,7 @@ OpenCV DNN으로 HED를 사용하려면 BSDS에서 학습된 Caffe 가중치가 
 
 ```powershell
 "C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" scripts/train_dqn.py ^
-	--timesteps 20000 ^
+	--timesteps 200000 ^
 	--image-dir inputs/train ^
 	--ground-truth-dir inputs/GT ^
 	--edge-dir outputs/hed/train_baseline ^
@@ -73,25 +74,91 @@ OpenCV DNN으로 HED를 사용하려면 BSDS에서 학습된 Caffe 가중치가 
 	--caffemodel models/hed/hed_pretrained_bsds.caffemodel ^
 	--hed-width 500 ^
 	--hed-height 500 ^
-	--tensorboard-log runs/dqn_train ^
-	--output artifacts/dqn_train
+	--image-log-frequency 5000 ^
+	--image-log-count 5 ^
+	--tensorboard-log runs/dqn ^
+	--output artifacts/dqn_hed
 ```
 
 - 실행 전 `numpy==1.26.4`, `opencv-python==4.8.1.78`, `tensorboard==2.20.0` 버전 호환성을 확인하세요.
 - `--prototxt/--caffemodel`을 생략하면 사전 계산된 에지(`--edge-dir`)만으로도 학습이 가능하지만, 옵션을 남겨두면 캐시 미스 시 자동으로 HED를 재생성합니다.
-- 학습이 끝나면 모델은 `artifacts/dqn_train.zip`(기본 확장자 `.zip`)로 저장되고, TensorBoard 로그는 `runs/dqn_train/` 하위에 생성됩니다.
+- 학습이 끝나면 모델은 `artifacts/dqn_hed.zip`(기본 확장자 `.zip`)로 저장되고, TensorBoard 로그는 `runs/dqn/` 하위에 생성됩니다.
 - 메모리를 절약하려면 `--no-cache-edges`를 지정해 에지 캐시를 비활성화할 수 있습니다.
+- `rollout_images/` 서브 디렉터리에는 TensorBoard 이미지 로그(초기 HED · 예측 · GT를 가로로 붙인 비교)가 저장되며, `--image-log-frequency`, `--image-log-count`로 간격과 샘플 수를 조정할 수 있습니다.
+
+### PPO 학습 실행
+
+```powershell
+"C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" scripts/train_ppo.py ^
+	--timesteps 200000 ^
+	--image-dir inputs/train ^
+	--ground-truth-dir inputs/GT ^
+	--edge-dir outputs/hed/train_baseline ^
+	--prototxt models/hed/deploy.prototxt ^
+	--caffemodel models/hed/hed_pretrained_bsds.caffemodel ^
+	--hed-width 500 ^
+	--hed-height 500 ^
+	--image-log-frequency 5000 ^
+	--image-log-count 5 ^
+	--tensorboard-log runs/ppo ^
+	--output artifacts/ppo_train
+```
+
+- Ray Tune로 얻은 최적 하이퍼파라미터를 `--learning-rate`, `--gamma`, `--batch-size` 등 CLI 옵션으로 즉시 덮어쓸 수 있습니다.
+- PPO 역시 TensorBoard 이미지 로그를 동일 형식으로 저장하며, `runs/ppo/`에서 학습 곡선과 롤아웃을 확인할 수 있습니다.
+
+### Ray Tune 하이퍼파라미터 탐색
+
+```powershell
+"C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" scripts/tune_hyperparams.py ^
+	--algo ppo ^
+	--timesteps 100000 ^
+	--num-samples 16 ^
+	--image-dir inputs/train ^
+	--ground-truth-dir inputs/GT ^
+	--edge-dir outputs/hed/train_baseline ^
+	--prototxt models/hed/deploy.prototxt ^
+	--caffemodel models/hed/hed_pretrained_bsds.caffemodel
+```
+
+- `--algo`로 `dqn`/`ppo` 중 선택하고, `--num-samples`로 탐색 trial 개수를 조정하세요.
+- 결과는 기본적으로 `runs/tune/hed_rl_tune` 하위에 저장되며, `result.json`으로 각 trial의 `mean_reward`를 확인할 수 있습니다.
+- Ray Tune은 추가 CPU를 활용할 수 있으므로, 병렬화를 위해 `--cpus-per-trial`과 `RAY_NUM_CPUS` 환경변수를 상황에 맞게 설정하세요.
+
+### 에이전트 평가 및 이미지 추출
+
+```powershell
+"C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" scripts/evaluate_agents.py ^
+	--dqn-model artifacts/dqn_hed.zip ^
+	--ppo-model artifacts/ppo_train.zip ^
+	--prototxt models/hed/deploy.prototxt ^
+	--caffemodel models/hed/hed_pretrained_bsds.caffemodel ^
+	--image-dir inputs/train ^
+	--ground-truth-dir inputs/GT ^
+	--edge-dir outputs/hed/train_baseline ^
+	--episodes 20 ^
+	--image-log-count 5 ^
+	--tensorboard-log runs/eval ^
+	--output-json artifacts/eval_results.json
+```
+
+- 스크립트는 모델별 평균/표준편차 보상과 에피소드 길이를 계산해 콘솔·JSON·TensorBoard에 동시 기록합니다.
+- 평가 중 로깅된 롤아웃 비교 이미지는 TensorBoard 이미지 탭과 `artifacts/eval_images/`(이벤트 파일에서 추출한 PNG)에서 시각화할 수 있습니다.
+- `--image-dir`로 전달한 데이터가 평가 대상이므로, 테스트셋 구분이 필요하면 해당 경로를 별도로 지정하세요.
 
 ### 학습 로그 시각화
 
 ```powershell
-& "C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" -m tensorboard.main --logdir runs/dqn_test
+& "C:/02_Sogang/25_02 ReinforceLearning/EdgeDetection/.venv/Scripts/python.exe" -m tensorboard.main --logdir runs
 ```
 
-- 브라우저에서 `http://localhost:6006/`을 열면 보상, 손실 등 핵심 지표를 실시간으로 확인할 수 있습니다.
-- 이벤트 파일은 `runs/dqn_test/DQN_1/`에 저장되며, Python에서 `tensorboard.backend.event_processing.EventAccumulator`로 파싱해 요약 통계를 계산할 수 있습니다.
+- 브라우저에서 `http://localhost:6006/`을 열면 학습(`runs/dqn`, `runs/ppo`), 튠(`runs/tune`), 평가(`runs/eval`) 로그를 하나의 대시보드에서 확인할 수 있습니다.
+- 이벤트 파일은 하위 폴더별(`runs/dqn/DQN_1/` 등)로 저장되며, Python에서 `tensorboard.backend.event_processing.EventAccumulator`로 파싱해 요약 통계를 계산할 수 있습니다.
 
 ### 산출물 정리
 
-- `artifacts/dqn_test.zip`: Stable-Baselines3 `DQN.load`로 재사용 가능한 최신 정책 가중치.
-- `artifacts/plots/dqn_training_metrics.png`: TensorBoard 로그 기반 학습 지표(보상, 에피소드 길이, 손실 등) 시각화 이미지.
+- `artifacts/dqn_hed.zip`: Ray Tune 추천 하이퍼파라미터로 200k timesteps 학습한 DQN 정책.
+- `artifacts/ppo_train.zip`: 동일 조건에서 학습한 PPO 정책.
+- `artifacts/eval_results.json`: PPO/DQN 20-에피소드 평가 통계(JSON).
+- `artifacts/eval_images/`: TensorBoard 이벤트에서 추출한 롤아웃 비교 PNG 묶음.
+- `runs/`: 학습(`runs/dqn`, `runs/ppo`), 하이퍼파라미터 탐색(`runs/tune`), 평가(`runs/eval`)용 TensorBoard 로그.

@@ -93,6 +93,7 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         self.image_paths: List[Path] = self._collect_images(config.image_dir)
         if not self.image_paths:
             raise ValueError(f"no images found in {config.image_dir}")
+        self._image_lookup = {path.name: path for path in self.image_paths}
 
         if config.ground_truth_dir is not None and not config.ground_truth_dir.exists():
             raise FileNotFoundError(f"ground truth directory not found: {config.ground_truth_dir}")
@@ -159,7 +160,22 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
             self.random.seed(seed)
 
         self.steps_taken = 0
-        self.current_image = self.random.choice(self.image_paths)
+        forced_image = None
+        if options:
+            if "image_path" in options and options["image_path"] is not None:
+                candidate = Path(str(options["image_path"]))
+                if not candidate.exists():  # pragma: no cover - defensive guard
+                    raise FileNotFoundError(f"forced image path not found: {candidate}")
+                forced_image = candidate
+            elif "image_name" in options and options["image_name"] is not None:
+                lookup_key = Path(str(options["image_name"]))
+                forced_image = self._image_lookup.get(lookup_key.name)
+                if forced_image is None:  # pragma: no cover - defensive guard
+                    raise KeyError(f"image name '{options['image_name']}' not found in dataset")
+        if forced_image is not None:
+            self.current_image = forced_image
+        else:
+            self.current_image = self.random.choice(self.image_paths)
         self.current_params = {spec.name: spec.initial for spec in self.parameter_specs}
         if self.hed_model is not None and self.current_image is not None:
             self._ensure_ground_truth(self.current_image)
