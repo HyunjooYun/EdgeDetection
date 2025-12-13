@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+import cv2
 import numpy as np
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -34,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensorboard-log", type=Path, help="Directory for TensorBoard evaluation logs")
     parser.add_argument("--image-log-count", type=int, default=3, help="How many rollout images to log per model")
     parser.add_argument("--output-json", type=Path, help="Optional path to save evaluation metrics as JSON")
+    parser.add_argument("--cycle-images", action="store_true", help="Iterate through dataset images without replacement")
+    parser.add_argument(
+        "--save-rollouts-dir",
+        type=Path,
+        help="Optional directory to save rollout comparison images as PNG files",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +68,7 @@ def prepare_env_factory(args: argparse.Namespace):
             max_steps=args.max_episode_steps,
             random_seed=args.seed,
             cache_edges=not args.no_cache_edges,
+            cycle_images=args.cycle_images,
         )
         return HEDPostProcessEnv(cfg)
 
@@ -80,6 +88,7 @@ def evaluate_model(
     writer: Optional[SummaryWriter],
     image_names: Iterable[str],
     log_step: int,
+    save_dir: Optional[Path],
 ) -> Dict[str, object]:
     env = Monitor(env_factory())
     try:
@@ -108,8 +117,9 @@ def evaluate_model(
             writer.add_scalar(f"{name}/mean_reward", summary["mean_reward"], log_step)
             writer.add_scalar(f"{name}/mean_episode_length", summary["mean_episode_length"], log_step)
             writer.add_scalar(f"{name}/reward_std", summary["std_reward"], log_step)
-            log_rollout_images(model, env_factory, image_names, writer, name, log_step)
             writer.flush()
+        if writer is not None or save_dir is not None:
+            log_rollout_images(model, env_factory, image_names, writer, name, log_step, save_dir)
         return summary
     finally:
         if hasattr(env, "close"):
@@ -120,13 +130,16 @@ def log_rollout_images(
     model,
     env_factory,
     image_names: Iterable[str],
-    writer: SummaryWriter,
+    writer: Optional[SummaryWriter],
     tag_prefix: str,
     step: int,
+    save_dir: Optional[Path],
 ) -> None:
     names: List[str] = list(image_names)
     if not names:
         return
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
     env = env_factory()
     try:
         for image_name in names:
@@ -143,8 +156,13 @@ def log_rollout_images(
             gt_edge = env._ground_truth_edges[env.current_image.name]
             pred_edge = env._apply_postprocessing(base_edge, env.current_params)
             canvas = compose_canvas(base_edge, pred_edge, gt_edge)
-            writer.add_image(f"{tag_prefix}/rollout/{image_name}", canvas, step, dataformats="HWC")
-        writer.flush()
+            if writer is not None:
+                writer.add_image(f"{tag_prefix}/rollout/{image_name}", canvas, step, dataformats="HWC")
+            if save_dir is not None:
+                filename = f"{Path(image_name).stem}_step{step}.png"
+                cv2.imwrite(str(save_dir / filename), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        if writer is not None:
+            writer.flush()
     finally:
         if hasattr(env, "close"):
             env.close()
@@ -176,8 +194,10 @@ def main() -> None:
 
     results: List[Dict[str, object]] = []
     log_step = 0
+    save_root = args.save_rollouts_dir
 
     if args.dqn_model and args.dqn_model.exists():
+        dqn_save_dir = save_root / "dqn" if save_root is not None else None
         summary = evaluate_model(
             name="dqn",
             model_path=args.dqn_model,
@@ -187,6 +207,7 @@ def main() -> None:
             writer=writer,
             image_names=image_names,
             log_step=log_step,
+            save_dir=dqn_save_dir,
         )
         results.append(summary)
         log_step += 1
@@ -196,6 +217,7 @@ def main() -> None:
         )
 
     if args.ppo_model and args.ppo_model.exists():
+        ppo_save_dir = save_root / "ppo" if save_root is not None else None
         summary = evaluate_model(
             name="ppo",
             model_path=args.ppo_model,
@@ -205,6 +227,7 @@ def main() -> None:
             writer=writer,
             image_names=image_names,
             log_step=log_step,
+            save_dir=ppo_save_dir,
         )
         results.append(summary)
         log_step += 1

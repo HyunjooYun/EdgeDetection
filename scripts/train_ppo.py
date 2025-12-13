@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-cache-edges", action="store_true", help="Disable edge caching inside the environment")
     parser.add_argument("--image-log-frequency", type=int, default=50_000, help="Timesteps between logging rollout images")
     parser.add_argument("--image-log-count", type=int, default=3, help="Number of dataset images to log as rollouts")
+    parser.add_argument("--cycle-images", action="store_true", help="Iterate through dataset images without replacement")
     parser.add_argument("--learning-rate", type=float, help="PPO learning rate override")
     parser.add_argument("--gamma", type=float, help="PPO discount factor override")
     parser.add_argument("--n-steps", type=int, help="Number of steps to run for each environment per update")
@@ -72,6 +73,7 @@ def build_env_factory(args: argparse.Namespace):
         precomputed_edge_dir=args.edge_dir,
         max_steps=args.max_episode_steps,
         cache_edges=not args.no_cache_edges,
+        cycle_images=args.cycle_images,
     )
 
     def make_env() -> HEDPostProcessEnv:
