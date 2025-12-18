@@ -64,3 +64,28 @@
 - **개발 환경**: Windows + NVIDIA RTX 4070 Ti Super, Python 3.14.x, PyTorch, Stable-Baselines3, OpenCV.
 - **버전 관리**: GitHub 레포지토리로 코드와 실험 로그 관리.
 - **재현성 확보**: Seed 고정, Docker 혹은 Conda 환경 YAML 제공.
+
+## 10. 구현 현황 및 계획 대비 차이
+- **데이터셋 범위**
+  - 계획: BSDS500, NYU Depth, 기타 도메인 이미지를 순차적으로 확대.
+  - 현재 구현: BSDS500 기반 inputs/train, inputs/val, inputs/test 각 200장만 사용하여 1차 실험 완료.
+  - cycle-images 옵션을 도입해 각 split 내 이미지를 중복 없이 순차 순회하도록 환경과 학습/평가 스크립트를 수정함.
+
+- **상태·행동 정의**
+  - 계획: 에지 밀도, 연속성 등 다양한 통계 피처를 상태에 포함하고, 연속 제어까지 포괄.
+  - 현재 구현: HED 출력 에지 맵과 후처리 파라메터(HEDPostProcessEnv 내부 상태)를 중심으로 상태를 구성하고, SB3 DQN/PPO가 다루기 쉬운 이산/연속 조합으로 행동을 제한적으로 설계함.
+
+- **보상 설계**
+  - 계획: F1, IoU, BPR, Pixel Accuracy의 가중합과 Curriculum을 활용한 복합 보상.
+  - 현재 구현: GT 대비 F1 기반 단일 보상 함수를 사용하며, artifacts/eval_*_cycle_200k.json에 mean/std/min/max 보상 통계를 기록.
+
+- **알고리즘 변형**
+  - 계획: Double DQN, Prioritized Replay, PPO 하이퍼파라미터 변형 등 여러 변종을 비교.
+  - 현재 구현: Stable-Baselines3의 기본 DQN, PPO로 200K 타임스텝 학습을 수행하였고, 변종 알고리즘은 후속 단계로 남겨 둠.
+
+- **평가 및 시각화**
+  - 계획: 다양한 지표와 파라메터 sensitivity 분석까지 포함.
+  - 현재 구현: train/val/test 각 200 에피소드에 대해 mean_reward와 episode length를 중심으로 평가하고, TensorBoard와 PNG 비교 이미지(artifacts/eval_images_cycle_200k/*)를 통해 정성적 분석을 수행.
+
+- **추가 구현 사항**
+  - 원 계획에는 없던 기능으로, 학습·평가 시 선택된 이미지에 대한 base/pred/GT 에지 맵을 PNG로 저장하는 옵션(--save-rollouts-dir)을 evaluate_agents.py에 추가하여 재현성과 보고용 시각화를 강화함.

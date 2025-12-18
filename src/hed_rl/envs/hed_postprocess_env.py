@@ -66,6 +66,7 @@ class HEDPostProcessConfig:
     random_seed: Optional[int] = None
     target_parameter_map: Optional[Dict[str, Dict[str, float]]] = None
     cache_edges: bool = True
+    cycle_images: bool = False
 
     def resolve_targets(self, image_ids: Iterable[str]) -> Dict[str, Dict[str, float]]:
         if self.target_parameter_map is not None:
@@ -112,6 +113,11 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
         self.steps_taken: int = 0
         self._base_edge_cache: Dict[str, np.ndarray] = {}
         self._ground_truth_edges: Dict[str, np.ndarray] = {}
+        self.cycle_images = bool(config.cycle_images)
+        self._cycle_indices: List[int] = list(range(len(self.image_paths)))
+        self._cycle_position: int = 0
+        if self.cycle_images:
+            self.random.shuffle(self._cycle_indices)
 
         obs_dim = 4 + len(self.parameter_specs) * 2
         if spaces:
@@ -174,6 +180,14 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
                     raise KeyError(f"image name '{options['image_name']}' not found in dataset")
         if forced_image is not None:
             self.current_image = forced_image
+        elif self.cycle_images:
+            if self._cycle_position >= len(self._cycle_indices):
+                self._cycle_indices = list(range(len(self.image_paths)))
+                self.random.shuffle(self._cycle_indices)
+                self._cycle_position = 0
+            index = self._cycle_indices[self._cycle_position]
+            self._cycle_position += 1
+            self.current_image = self.image_paths[index]
         else:
             self.current_image = self.random.choice(self.image_paths)
         self.current_params = {spec.name: spec.initial for spec in self.parameter_specs}
