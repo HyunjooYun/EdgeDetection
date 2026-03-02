@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Callable, Iterable, List
 
 import numpy as np
+import torch as th
 from stable_baselines3 import DQN
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
 from torch.utils.tensorboard import SummaryWriter
 
@@ -48,6 +49,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-steps", type=int, help="Number of gradient steps at each update")
     parser.add_argument("--exploration-fraction", type=float, help="Fraction of training spent exploring")
     parser.add_argument("--exploration-final-eps", type=float, help="Final epsilon for epsilon-greedy policy")
+    parser.add_argument(
+        "--eval-frequency",
+        type=int,
+        default=10000,
+        help="Timesteps between evaluation rollouts for scalar metrics",
+    )
+    parser.add_argument(
+        "--diag-frequency",
+        type=int,
+        default=5000,
+        help="Timesteps between Q-value/TD-error diagnostics from the replay buffer",
+    )
+    parser.add_argument(
+        "--diag-samples",
+        type=int,
+        default=1024,
+        help="Number of samples from the replay buffer for diagnostics",
+    )
     return parser.parse_args()
 
 
@@ -119,6 +138,141 @@ class RolloutImageCallback(BaseCallback):
         pred_rgb = to_rgb(pred_edge)
         gt_rgb = to_rgb(gt_edge)
         return np.concatenate([base_rgb, pred_rgb, gt_rgb], axis=1)
+
+
+class EvalRewardCallback(BaseCallback):
+    """Periodically evaluate the deterministic policy and log reward stats.
+
+    This runs rollouts on a fixed set of images and logs scalar metrics such as
+    mean/std/max episode reward to TensorBoard (e.g. ``eval/reward_mean``).
+    """
+
+    def __init__(
+        self,
+        eval_env_fn: Callable[[], HEDPostProcessEnv],
+        image_names: Iterable[str],
+        eval_frequency: int,
+    ) -> None:
+        super().__init__()
+        self.eval_env = eval_env_fn()
+        self.image_names: List[str] = list(image_names)
+        self.eval_frequency = max(1, int(eval_frequency))
+        self.last_eval_step = 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self.last_eval_step < self.eval_frequency:
+            return True
+
+        self.last_eval_step = self.num_timesteps
+        if not self.image_names:
+            return True
+
+        rewards: List[float] = []
+        for image_name in self.image_names:
+            obs, _ = self.eval_env.reset(options={"image_name": image_name})
+            terminated = False
+            truncated = False
+            last_reward = 0.0
+            steps = 0
+            while not (terminated or truncated):
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, _info = self.eval_env.step(action)
+                last_reward = float(reward)
+                steps += 1
+                if steps >= self.eval_env.config.max_steps:
+                    break
+            rewards.append(last_reward)
+
+        if rewards:
+            rewards_array = np.asarray(rewards, dtype=np.float32)
+            self.logger.record("eval/reward_mean", float(rewards_array.mean()))
+            self.logger.record("eval/reward_std", float(rewards_array.std()))
+            self.logger.record("eval/reward_max", float(rewards_array.max()))
+
+        return True
+
+    def _on_training_end(self) -> None:
+        if hasattr(self.eval_env, "close"):
+            self.eval_env.close()
+
+
+class QDiagnosticsCallback(BaseCallback):
+    """Log Q-value and TD error statistics from the replay buffer.
+
+    Periodically samples a minibatch from the replay buffer and computes
+    summary statistics of the predicted Q-values and 1-step TD errors.
+    These are logged to TensorBoard under ``diagnostics/*``.
+    """
+
+    def __init__(self, sample_size: int, log_frequency: int) -> None:
+        super().__init__()
+        self.sample_size = max(1, int(sample_size))
+        self.log_frequency = max(1, int(log_frequency))
+        self.last_log_step = 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self.last_log_step < self.log_frequency:
+            return True
+
+        self.last_log_step = self.num_timesteps
+
+        model = self.model
+        replay_buffer = getattr(model, "replay_buffer", None)
+        if replay_buffer is None:
+            return True
+
+        # Some stable-baselines3 versions do not implement __len__ for ReplayBuffer.
+        # Prefer the "buffer_size" attribute when available, otherwise fall back to len().
+        buffer_len = getattr(replay_buffer, "buffer_size", None)
+        if buffer_len is None:
+            try:
+                buffer_len = len(replay_buffer)  # type: ignore[arg-type]
+            except TypeError:
+                return True
+
+        if buffer_len == 0:
+            return True
+
+        batch_size = min(self.sample_size, int(buffer_len))
+
+        # Sample a batch similarly to the DQN.train() method
+        replay_data = replay_buffer.sample(batch_size, env=model._vec_normalize_env)
+
+        with th.no_grad():
+            # Q-value statistics for current observations
+            all_q_values = model.q_net(replay_data.observations)
+            q_np = all_q_values.detach().cpu().numpy()
+            self.logger.record("diagnostics/q_mean", float(q_np.mean()))
+            self.logger.record("diagnostics/q_std", float(q_np.std()))
+            self.logger.record("diagnostics/q_max", float(q_np.max()))
+            self.logger.record("diagnostics/q_min", float(q_np.min()))
+
+            # Compute 1-step TD targets, mirroring DQN.train()
+            next_q_values = model.q_net_target(replay_data.next_observations)
+            next_q_values, _ = next_q_values.max(dim=1)
+            next_q_values = next_q_values.reshape(-1, 1)
+
+            discounts = (
+                replay_data.discounts if replay_data.discounts is not None else model.gamma
+            )
+            target_q_values = (
+                replay_data.rewards
+                + (1 - replay_data.dones) * discounts * next_q_values
+            )
+
+            current_q_values = model.q_net(replay_data.observations)
+            current_q_values = th.gather(
+                current_q_values, dim=1, index=replay_data.actions.long()
+            )
+
+            td_errors = (target_q_values - current_q_values).detach().cpu().numpy()
+            self.logger.record("diagnostics/td_error_mean", float(td_errors.mean()))
+            self.logger.record("diagnostics/td_error_std", float(td_errors.std()))
+            self.logger.record(
+                "diagnostics/td_error_abs_mean", float(np.abs(td_errors).mean())
+            )
+
+        return True
 
 
 def main() -> None:
@@ -193,12 +347,25 @@ def main() -> None:
         seed=args.seed,
     )
 
-    callback = RolloutImageCallback(
+    rollout_callback = RolloutImageCallback(
         eval_env_fn=make_env,
         image_names=image_names,
         log_dir=args.tensorboard_log,
         log_frequency=args.image_log_frequency,
     )
+
+    eval_callback = EvalRewardCallback(
+        eval_env_fn=make_env,
+        image_names=image_names,
+        eval_frequency=args.eval_frequency,
+    )
+
+    q_diag_callback = QDiagnosticsCallback(
+        sample_size=args.diag_samples,
+        log_frequency=args.diag_frequency,
+    )
+
+    callback = CallbackList([rollout_callback, eval_callback, q_diag_callback])
 
     model.learn(total_timesteps=args.timesteps, log_interval=100, callback=callback)
 
