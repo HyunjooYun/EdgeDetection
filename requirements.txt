@@ -5,3 +5,4 @@ stable-baselines3>=2.2.0
 torch>=2.3.0
 pypdf>=4.0.0
 ray[tune]>=2.9.0
+scipy>=1.10.0

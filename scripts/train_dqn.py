@@ -21,6 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prototxt", type=Path, help="Path to HED deploy.prototxt")
     parser.add_argument("--caffemodel", type=Path, help="Path to HED caffemodel")
     parser.add_argument("--image-dir", type=Path, default=Path("imgs/test"), help="Directory with training images")
+    parser.add_argument(
+        "--eval-image-dir",
+        type=Path,
+        help="Directory with images used for evaluation rollouts (defaults to --image-dir)",
+    )
     parser.add_argument("--ground-truth-dir", type=Path, help="Directory with ground-truth edge maps")
     parser.add_argument("--edge-dir", type=Path, help="Directory with precomputed base HED edge maps")
     parser.add_argument("--timesteps", type=int, default=50000, help="Total training timesteps")
@@ -39,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-cache-edges", action="store_true", help="Disable edge caching inside the environment")
     parser.add_argument("--image-log-frequency", type=int, default=5000, help="Timesteps between logging rollout images")
     parser.add_argument("--image-log-count", type=int, default=3, help="Number of dataset images to log as rollouts")
+    parser.add_argument(
+        "--image-log-names",
+        type=str,
+        help="Comma-separated list of image filenames to use for rollout images (e.g. '12003.jpg,15004.jpg')",
+    )
     parser.add_argument("--cycle-images", action="store_true", help="Iterate through dataset images without replacement")
     parser.add_argument("--learning-rate", type=float, help="DQN learning rate override")
     parser.add_argument("--gamma", type=float, help="Discount factor override")
@@ -87,6 +97,7 @@ class RolloutImageCallback(BaseCallback):
         self.last_logged_step = 0
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(str(log_dir / "rollout_images"))
+        self._writer_failed = False
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self.last_logged_step >= self.log_frequency:
@@ -102,7 +113,7 @@ class RolloutImageCallback(BaseCallback):
         self.writer.close()
 
     def _log_images(self) -> None:
-        if not self.image_names:
+        if self._writer_failed or not self.image_names:
             return
         for image_name in self.image_names:
             obs, _ = self.eval_env.reset(options={"image_name": image_name})
@@ -119,10 +130,15 @@ class RolloutImageCallback(BaseCallback):
             gt_edge = self.eval_env._ground_truth_edges[self.eval_env.current_image.name]
             pred_edge = self.eval_env._apply_postprocessing(base_edge, self.eval_env.current_params)
             canvas = self._compose_canvas(base_edge, pred_edge, gt_edge)
-            self.writer.add_image(
-                f"rollout/{image_name}", canvas, self.num_timesteps, dataformats="HWC"
-            )
-        self.writer.flush()
+            try:
+                self.writer.add_image(
+                    f"rollout/{image_name}", canvas, self.num_timesteps, dataformats="HWC"
+                )
+            except Exception:
+                self._writer_failed = True
+                return
+        if not self._writer_failed:
+            self.writer.flush()
 
     @staticmethod
     def _compose_canvas(base_edge: np.ndarray, pred_edge: np.ndarray, gt_edge: np.ndarray) -> np.ndarray:
@@ -293,6 +309,7 @@ def main() -> None:
     elif not args.edge_dir:
         raise ValueError("Either provide HED prototxt/caffemodel or a precomputed edge directory")
 
+    # Training environment (typically using train images)
     def make_env() -> HEDPostProcessEnv:
         cfg = HEDPostProcessConfig(
             image_dir=args.image_dir,
@@ -300,13 +317,42 @@ def main() -> None:
             ground_truth_dir=args.ground_truth_dir,
             precomputed_edge_dir=args.edge_dir,
             max_steps=args.max_episode_steps,
+            random_seed=args.seed,
+            cache_edges=not args.no_cache_edges,
+            cycle_images=args.cycle_images,
+        )
+        return HEDPostProcessEnv(cfg)
+
+    # Evaluation/rollout environment (can be a separate val set)
+    eval_image_dir = args.eval_image_dir or args.image_dir
+
+    def make_eval_env() -> HEDPostProcessEnv:
+        cfg = HEDPostProcessConfig(
+            image_dir=eval_image_dir,
+            hed_config=hed_config,
+            ground_truth_dir=args.ground_truth_dir,
+            precomputed_edge_dir=args.edge_dir,
+            max_steps=args.max_episode_steps,
+            random_seed=args.seed,
             cache_edges=not args.no_cache_edges,
             cycle_images=args.cycle_images,
         )
         return HEDPostProcessEnv(cfg)
 
     sample_env = make_env()
-    image_names = [path.name for path in sample_env.image_paths[: args.image_log_count]]
+    sample_eval_env = make_eval_env()
+
+    # Choose which images to use for rollout logging (from eval set).
+    # If --image-log-names is provided, use that subset (if available);
+    # otherwise fall back to the first image_log_count images.
+    if args.image_log_names:
+        requested = [name.strip() for name in str(args.image_log_names).split(",") if name.strip()]
+        available = {path.name for path in sample_eval_env.image_paths}
+        image_names = [name for name in requested if name in available]
+        if not image_names:
+            image_names = [path.name for path in sample_eval_env.image_paths[: args.image_log_count]]
+    else:
+        image_names = [path.name for path in sample_eval_env.image_paths[: args.image_log_count]]
 
     vec_env = make_vec_env(make_env, n_envs=args.n_envs, seed=args.seed)
 
@@ -348,14 +394,14 @@ def main() -> None:
     )
 
     rollout_callback = RolloutImageCallback(
-        eval_env_fn=make_env,
+        eval_env_fn=make_eval_env,
         image_names=image_names,
         log_dir=args.tensorboard_log,
         log_frequency=args.image_log_frequency,
     )
 
     eval_callback = EvalRewardCallback(
-        eval_env_fn=make_env,
+        eval_env_fn=make_eval_env,
         image_names=image_names,
         eval_frequency=args.eval_frequency,
     )
@@ -374,6 +420,8 @@ def main() -> None:
     vec_env.close()
     if hasattr(sample_env, "close"):
         sample_env.close()
+    if hasattr(sample_eval_env, "close"):
+        sample_eval_env.close()
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - required at runtime
     raise RuntimeError("numpy is required to use HEDPostProcessEnv") from exc
 
 import cv2
+import scipy.io as sio
 
 from ..pipeline.hed_inference import HEDModel, HedConfig
 
@@ -71,10 +72,14 @@ class HEDPostProcessConfig:
     def resolve_targets(self, image_ids: Iterable[str]) -> Dict[str, Dict[str, float]]:
         if self.target_parameter_map is not None:
             return self.target_parameter_map
+        # Use a deterministic RNG when a random_seed is provided so that
+        # different agents (DQN, PPO, evaluation scripts) generate the
+        # same synthetic target parameters for a given dataset.
+        rng = random.Random(self.random_seed) if self.random_seed is not None else random
         defaults: Dict[str, Dict[str, float]] = {}
         for image_id in image_ids:
             defaults[image_id] = {
-                spec.name: random.uniform(spec.minimum, spec.maximum) for spec in self.parameter_specs
+                spec.name: rng.uniform(spec.minimum, spec.maximum) for spec in self.parameter_specs
             }
         return defaults
 
@@ -339,14 +344,62 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
             self.config.ground_truth_dir / image_path.name,
             self.config.ground_truth_dir / f"{image_path.stem}.png",
             self.config.ground_truth_dir / f"{image_path.stem}.jpg",
+            self.config.ground_truth_dir / f"{image_path.stem}.mat",
         ]
         for candidate in candidates:
-            if candidate.exists():
+            if not candidate.exists():
+                continue
+
+            # Image formats (PNG/JPG): load via OpenCV.
+            if candidate.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
                 gt = cv2.imread(str(candidate), cv2.IMREAD_GRAYSCALE)
                 if gt is None:
                     continue
                 normalized = gt.astype(np.float32) / 255.0
                 return normalized
+
+            # BSDS-style MATLAB ground truth (e.g., 12003.mat with "groundTruth").
+            if candidate.suffix.lower() == ".mat":
+                try:
+                    data = sio.loadmat(str(candidate))
+                except Exception:
+                    continue
+
+                gt_array = None
+
+                # BSDS500 convention: data["groundTruth"][0] is a list of structs,
+                # each with a "Boundaries" field (H x W, 0/1 or [0,1] float).
+                if "groundTruth" in data:
+                    try:
+                        gt_cells = data["groundTruth"][0]
+                        if len(gt_cells) > 0:
+                            # Aggregate multiple annotators by max over boundaries.
+                            first_boundaries = gt_cells[0][0]["Boundaries"]
+                            acc = np.zeros_like(first_boundaries, dtype=np.float32)
+                            for gt_entry in gt_cells:
+                                boundaries = gt_entry[0]["Boundaries"].astype(
+                                    np.float32
+                                )
+                                acc = np.maximum(acc, boundaries)
+                            gt_array = acc
+                    except Exception:
+                        gt_array = None
+
+                # Fallback: some .mat files may store a direct edge map.
+                if gt_array is None:
+                    for key in ("edge", "edges", "gt"):
+                        if key in data:
+                            arr = np.asarray(data[key], dtype=np.float32)
+                            if arr.ndim >= 2:
+                                gt_array = arr
+                                break
+
+                if gt_array is not None:
+                    gt_array = np.asarray(gt_array, dtype=np.float32)
+                    # Ensure values in [0,1]. For BSDS boundaries this is already true,
+                    # but we clip defensively.
+                    gt_array = np.clip(gt_array, 0.0, 1.0)
+                    return gt_array
         return None
 
     def _apply_postprocessing(self, base_edge: np.ndarray, params: Dict[str, float]) -> np.ndarray:
@@ -374,18 +427,53 @@ class HEDPostProcessEnv(gym.Env if gym else object):  # type: ignore[misc]
 
     @staticmethod
     def _f1_score(prediction: np.ndarray, target: np.ndarray) -> float:
-        pred = (prediction > 0.5).astype(np.uint8)
-        tgt = (target > 0.5).astype(np.uint8)
-        tp = int(np.logical_and(pred == 1, tgt == 1).sum())
-        fp = int(np.logical_and(pred == 1, tgt == 0).sum())
-        fn = int(np.logical_and(pred == 0, tgt == 1).sum())
-        if tp == 0:
+        """Boundary-based F1 (BPR-style) between prediction and target.
+
+        This treats both inputs as boundary maps in [0, 1], binarizes at 0.5,
+        and computes boundary precision/recall with a small spatial tolerance
+        using distance transforms (no external SciPy dependency).
+        """
+
+        # Binarize prediction and target
+        pred_bin = (prediction > 0.5).astype(np.uint8)
+        tgt_bin = (target > 0.5).astype(np.uint8)
+
+        # If there are no positives in both maps, original implementation
+        # would return 0.0 (tp == 0); keep the same behavior.
+        if pred_bin.sum() == 0 and tgt_bin.sum() == 0:
             return 0.0
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        if precision + recall == 0:
+
+        # Distance transforms: distance to nearest boundary pixel
+        # For OpenCV, distanceTransform computes distance to nearest zero
+        # in the source image, so we feed the complement (0 on edges).
+        # Use L2 distance with 3x3 mask, which is standard.
+        pred_comp = (1 - pred_bin).astype(np.uint8)
+        tgt_comp = (1 - tgt_bin).astype(np.uint8)
+
+        dt_to_pred = cv2.distanceTransform(pred_comp, cv2.DIST_L2, 3)
+        dt_to_tgt = cv2.distanceTransform(tgt_comp, cv2.DIST_L2, 3)
+
+        # Matching tolerance radius (in pixels). For BSDS-style evaluation,
+        # a small radius such as 1~3 is typical; we fix r=2 here.
+        r = 2.0
+        eps = 1e-8
+
+        # Matched predicted boundary pixels: those that lie within r of any GT pixel
+        matched_pred = (pred_bin == 1) & (dt_to_tgt <= r)
+        tp_pred = int(matched_pred.sum())
+        fp_pred = int(pred_bin.sum() - tp_pred)
+
+        # Covered GT boundary pixels: those that lie within r of any predicted pixel
+        covered_gt = (tgt_bin == 1) & (dt_to_pred <= r)
+        tp_gt = int(covered_gt.sum())
+        fn_gt = int(tgt_bin.sum() - tp_gt)
+
+        # Boundary precision / recall
+        p_b = tp_pred / (tp_pred + fp_pred + eps)
+        r_b = tp_gt / (tp_gt + fn_gt + eps)
+        if p_b + r_b == 0.0:
             return 0.0
-        return float(2 * precision * recall / (precision + recall))
+        return float(2.0 * p_b * r_b / (p_b + r_b + eps))
 
 
 __all__ = ["HEDPostProcessEnv", "HEDPostProcessConfig", "ParameterSpec"]

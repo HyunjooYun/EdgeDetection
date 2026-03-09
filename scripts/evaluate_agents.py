@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hed-height", type=int, default=0, help="Optional HED input height override")
     parser.add_argument("--no-cache-edges", action="store_true", help="Disable edge caching inside the environment")
     parser.add_argument("--tensorboard-log", type=Path, help="Directory for TensorBoard evaluation logs")
-    parser.add_argument("--image-log-count", type=int, default=3, help="How many rollout images to log per model")
+    parser.add_argument(
+        "--image-log-count",
+        type=int,
+        default=20,
+        help="How many rollout images to log per model (number of PNG comparisons per agent)",
+    )
     parser.add_argument("--output-json", type=Path, help="Optional path to save evaluation metrics as JSON")
     parser.add_argument("--cycle-images", action="store_true", help="Iterate through dataset images without replacement")
     parser.add_argument(
