@@ -76,13 +76,12 @@ def main() -> None:
 
     print("Using tag: rollout/ep_rew_mean, threshold: 90% of final 20 points")
 
-    # Analyze 0305 runs (multiple seeds) which correspond to
-    # artifacts/dqn_bpr_200k_0305.zip and artifacts/ppo_train_0305.zip.
-    runs_root_0305 = project_root / "runs" / "0305"
-    dqn_root_0305 = runs_root_0305 / "DQN"
-    ppo_root_0305 = runs_root_0305 / "PPO"
+    # Analyze the latest 0310 runs
+    runs_root = project_root / "runs" / "0310"
+    dqn_root = runs_root / "DQN"
+    ppo_root = runs_root / "PPO"
 
-    for algo, root in [("DQN", dqn_root_0305), ("PPO", ppo_root_0305)]:
+    for algo, root in [("DQN", dqn_root), ("PPO", ppo_root)]:
         if not root.exists():
             print(f"[WARN] Root directory not found for {algo} (0305): {root}")
             continue

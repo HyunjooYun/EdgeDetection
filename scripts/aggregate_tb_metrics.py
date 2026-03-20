@@ -53,11 +53,12 @@ def load_scalars(run_dir: Path) -> Dict[str, List[float]]:
 
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    runs_root = project_root / "runs" / "0305"
+    # Adjust root to analyze the latest 200k runs (0310).
+    runs_root = project_root / "runs" / "0310"
 
     runs = {
-        "DQN_3": runs_root / "DQN" / "DQN_3",
-        "PPO_2": runs_root / "PPO" / "PPO_2",
+        "DQN_1": runs_root / "DQN" / "DQN_1",
+        "PPO_1": runs_root / "PPO" / "PPO_1",
     }
 
     for name, run_dir in runs.items():

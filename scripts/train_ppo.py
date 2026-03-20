@@ -193,7 +193,16 @@ def main() -> None:
     else:
         image_names = collect_image_names(sample_eval_env, args.image_log_count)
 
-    vec_env = make_vec_env(make_env, n_envs=args.n_envs, seed=args.seed)
+    # Wrap environments with Monitor and log all episode statistics to disk
+    # so that we can compute exact metrics over the whole training.
+    monitor_dir = args.tensorboard_log / "monitor"
+    monitor_dir.mkdir(parents=True, exist_ok=True)
+    vec_env = make_vec_env(
+        make_env,
+        n_envs=args.n_envs,
+        seed=args.seed,
+        monitor_dir=str(monitor_dir),
+    )
 
     ppo_kwargs = {
         "learning_rate": args.learning_rate,
